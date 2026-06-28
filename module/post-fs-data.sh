@@ -70,7 +70,11 @@ if [ -d "${APEX_CACERTS}" ]; then
     # Clone the live cert directory into a tmpfs overlay.
     rm -rf "${AG_TMP}"
     mkdir -p "${AG_TMP}"
-    mount -t tmpfs tmpfs "${AG_TMP}"
+    if ! mount -t tmpfs tmpfs "${AG_TMP}"; then
+        echo "Failed to mount tmpfs at ${AG_TMP}, aborting APEX injection."
+        rmdir "${AG_TMP}"
+        exit 0
+    fi
     cp -f "${APEX_CACERTS}/"* "${AG_TMP}/"
 
     # Inject AdGuard's cert into the overlay.
@@ -90,7 +94,7 @@ if [ -d "${APEX_CACERTS}" ]; then
         for pid in 1 $(pgrep zygote) $(pgrep zygote64) $(pgrep system_server); do
             [ -f "/proc/${pid}/ns/mnt" ] || continue
             nsenter --mount="/proc/${pid}/ns/mnt" -- \
-                /bin/mount --bind "${AG_TMP}" "${APEX_CACERTS}" \
+                /bin/mount --bind "/proc/$$/root${AG_TMP}" "${APEX_CACERTS}" \
                 || echo "nsenter: propagation failed for pid ${pid}, skipping."
         done
 
@@ -99,9 +103,17 @@ if [ -d "${APEX_CACERTS}" ]; then
         for versioned in /apex/com.android.conscrypt@*/cacerts; do
             [ -d "${versioned}" ] || continue
             # Avoid double-mounting if the versioned path is the same inode.
-            [ "${versioned}" = "${APEX_CACERTS}" ] && continue
+            [ "$(stat -c %i "${versioned}")" = "$(stat -c %i "${APEX_CACERTS}")" ] && continue
             mount --bind "${AG_TMP}" "${versioned}" \
                 || echo "versioned APEX mount skipped: ${versioned}"
+
+            # Propagate versioned APEX mount into target namespaces.
+            for pid in 1 $(pgrep zygote) $(pgrep zygote64) $(pgrep system_server); do
+                [ -f "/proc/${pid}/ns/mnt" ] || continue
+                nsenter --mount="/proc/${pid}/ns/mnt" -- \
+                    /bin/mount --bind "/proc/$$/root${AG_TMP}" "${versioned}" \
+                    || echo "nsenter: versioned APEX propagation failed for pid ${pid}, path ${versioned}, skipping."
+            done
         done
     else
         echo "Safety check failed: only ${CERTS_NUM} cert(s) in tmpfs — aborting APEX injection."
